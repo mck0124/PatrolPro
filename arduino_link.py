@@ -13,17 +13,21 @@ Jetson -> Arduino events (sent via send()):
   FACE_VERIFIED:<name>     face matched database
   FACE_UNKNOWN             face detected but no DB match (after timeout)
   FACE_TIMEOUT             person left frame without being verified
+  ARRIVAL_REACHED          route endpoint QR marker was detected
+  EMERGENCY_STOP           latch Arduino in motor-stop mode
   HEARTBEAT                keep-alive ping every 2 s
 
 Arduino -> Jetson commands (received via callback):
   PLAY:<name>              play named audio clip (e.g. alert_fire, verified)
   MODE:<state>             current Arduino mode (PATROL / FIRE_ALERT / ...)
-  SNAP:<category>          save a snapshot frame (person / face / verified)
+  SNAP:<category>          save a snapshot frame (person / face / verified / unknown / fire)
 """
 
 import threading
 import queue
 import time
+import glob
+import os
 import serial
 from typing import Callable, List, Optional
 import audio_player
@@ -35,6 +39,11 @@ SERIAL_BAUD          = 115200
 RECONNECT_DELAY_S    = 3.0
 HEARTBEAT_INTERVAL_S = 2.0
 LINE_BUF_SIZE        = 128
+PORT_PATTERNS        = ("/dev/ttyUSB*", "/dev/ttyACM*")
+MODE_SNAPSHOT_CATEGORIES = {
+    "FIRE_ALERT": "fire_immediate",
+    "SECURITY_ALERT": "unknown",
+}
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -101,10 +110,12 @@ class ArduinoLink:
         while not self._stop_event.is_set():
             ser = None
             try:
-                ser = serial.Serial(self._port, self._baud, timeout=0.1)
+                port = self._resolve_port()
+                ser = serial.Serial(port, self._baud, timeout=0.1)
                 # Arduino Mega resets on USB open — wait for it to boot
                 time.sleep(2.0)
                 self._connected = True
+                self._port = port
                 print(f"[ArduinoLink] connected to {self._port}")
 
                 last_heartbeat = 0.0
@@ -151,6 +162,23 @@ class ArduinoLink:
 
             self._stop_event.wait(RECONNECT_DELAY_S)
 
+    def _resolve_port(self) -> str:
+        """Use the configured port when present; otherwise find Arduino-like USB serial ports."""
+        if self._port and os.path.exists(self._port):
+            return self._port
+
+        candidates = []
+        for pattern in PORT_PATTERNS:
+            candidates.extend(glob.glob(pattern))
+        candidates = sorted(set(candidates))
+
+        if candidates:
+            chosen = candidates[0]
+            print(f"[ArduinoLink] {self._port} not found; using {chosen}")
+            return chosen
+
+        return self._port
+
     def _dispatch(self, line: str):
         """Parse inbound line and call registered handlers for PLAY/MODE/SNAP."""
         if ":" in line:
@@ -191,6 +219,9 @@ def default_command_handler(cmd: str, arg: str):
         print(f"\n{'─'*40}")
         print(f"  [Arduino mode] {arg}")
         print(f"{'─'*40}")
+        category = MODE_SNAPSHOT_CATEGORIES.get(arg.upper())
+        if category:
+            snapshot_writer.save_current(category)
 
     elif cmd == "SNAP":
         snapshot_writer.save_current(arg)

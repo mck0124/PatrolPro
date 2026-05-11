@@ -74,7 +74,8 @@ def stop():
 def _generate_verified(name: str, wav_path: str):
     """Generate verified_<name>.wav at 48 kHz using pico2wave or espeak."""
     os.makedirs(AUDIO_DIR, exist_ok=True)
-    text = f"Identity verified. Welcome, {name}."
+    spoken_name = name.replace("_", " ")
+    text = f"Identity verified. Welcome, {spoken_name}."
     tmp = wav_path + ".tmp.wav"
 
     if shutil.which("pico2wave") and shutil.which("sox"):

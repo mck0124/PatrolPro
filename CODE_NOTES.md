@@ -14,12 +14,15 @@ See SESSION_NOTES.md for environment, errors, pipeline architecture, and enrollm
 | `enroll.py` | Offline face database builder | Active |
 | `capture_enroll.py` | Interactive camera capture for enrollment photos | Active |
 | `test_face_detect.py` | Standalone YOLO + SSD face detection test (no recognition) | Retired / reference only |
+| `PatrolPro_Phase2/` | Modular Arduino Mega firmware for patrol, hazard, verification, manual drive, and emergency stop | Active |
 | `hazard_monitor/hazard_monitor.ino` | Arduino firmware — LED, servo, buzzer, ultrasonic, OLED display | Active |
 | `Servo_test/Servo_test.ino` | Standalone servo test — smooth 90↔130° sweep via serial command | Reference |
 | `wall_bounce/wall_bounce.ino` | 4-motor drive + wall-bounce navigation (front ultrasonic) | Active |
 | `arduino_link.py` | Jetson-side USB serial bridge to Arduino Mega | Active |
 | `audio_player.py` | Non-blocking aplay wrapper + TTS fallback for verified_<name> | Active |
 | `snapshot_writer.py` | Saves JPEG frame crops + CSV event log at each track transition | Active |
+| `web_dashboard.py` | Browser dashboard for live MJPEG video, snapshots, and event logs | Active |
+| `generate_arrival_qr.py` | Generates the printable route-arrival QR marker SVG | Run when marker changes |
 | `generate_audio.py` | Generates all required WAV clips via espeak+sox (run once on Jetson) | Run once |
 | `bt_receiver.py` | Remote laptop script — reads HC-05 BT serial, prints formatted alerts | Run on laptop |
 
@@ -42,7 +45,11 @@ See SESSION_NOTES.md for environment, errors, pipeline architecture, and enrollm
 | `preprocess(frame)` | BGR frame → 320×320 NCHW float32 [0,1] for YOLO input. |
 | `postprocess(output, w, h)` | Decodes YOLO `[1,84,8400]` output → person boxes + NMS. Returns `(boxes, confs)`. |
 | `draw(frame, active_tracks, verified_ids, track_names)` | Draws green (verified + name) or red (identifying) boxes. Person count overlay. |
-| `main()` | Full loop: load engine → open camera → infer → track → face ID (throttled) → display. |
+| `detect_qr_payload(frame, detector)` | Uses OpenCV `QRCodeDetector` on multiple frame candidates to read the route-arrival QR marker. |
+| `draw_qr_marker(frame, points, label)` | Draws the detected QR marker outline on the dashboard/video frame. |
+| `_dashboard_control(link, command)` | Handles browser dashboard control commands; sends/logs `EMERGENCY_STOP`, `AUTO_PATROL`, and `PATROL_STOP`. |
+| `build_parser()` | Adds optional runtime flags for the browser dashboard and local OpenCV display. |
+| `main()` | Full loop: load engine → open camera → infer → track → face ID (throttled) → display and optional web dashboard. |
 
 **Key config at top of file:**
 ```python
@@ -51,13 +58,23 @@ INPUT_W, INPUT_H       = 320, 320
 CONF_THRESH            = 0.5
 IOU_THRESH             = 0.45
 FACE_ID_EVERY_N_FRAMES = 8      # face ID runs every 8 frames (~4x/sec at 30fps)
+ANNOUNCE_CONFIRM_FRAMES = 24    # consecutive active frames before PERSON_DETECTED
 PERSON_CLS             = 0      # COCO class 0 = person
+ALIGN_LEFT_MAX_RATIO   = 0.40
+ALIGN_RIGHT_MIN_RATIO  = 0.60
+ARRIVAL_QR_PAYLOAD     = "PATROLPRO:ARRIVAL:1"
+QR_DETECT_EVERY_N_FRAMES = 1
+ARRIVAL_CONFIRM_DETECTIONS = 1
+QR_FALLBACK_SCALE      = 1.5
 ```
 
 **Important details:**
 - `track_names = {}` dict maps `track_id → name`; populated on verification, used by `draw()`
 - `face_id.close()` called after the main loop to prevent segfault on exit
 - Camera opened via GStreamer pipeline (`nvarguscamerasrc`, flip-method=2)
+- Browser dashboard is off by default. Run with `--web`; add `--no-local-display` for headless SSH/demo use.
+- Route arrival is QR-based. The QR marker is checked every frame immediately after camera capture, before YOLO/face work. If `PATROLPRO:ARRIVAL:1` is decoded once, Jetson sends `ARRIVAL_REACHED`, saves a full-frame `arrival` snapshot, and logs `ARRIVAL_REACHED`.
+- Once a person track is stable for `ANNOUNCE_CONFIRM_FRAMES`, Jetson saves a `person` snapshot and sends `PERSON_DETECTED`; `STATUS:Tn:SCANNING:<LEFT|CENTER|RIGHT>` stays in the status packet so Arduino can apply a short heading correction before face scan when needed.
 
 ---
 
@@ -195,6 +212,50 @@ SSD_CONF_THRESH      = 0.5
 - Draws blue boxes (person), green boxes (face), FPS/count overlay
 
 ---
+
+## PatrolPro_Phase2/ modular Arduino firmware
+
+**Role:** Current Arduino Mega firmware split into small modules. Arduino remains the mode-state owner; Jetson sends compact serial events and the Arduino decides whether to patrol, verify, alert, manually drive, or emergency stop.
+
+**Key files:**
+
+| File | Role |
+|---|---|
+| `PatrolPro_Phase2.ino` | Main setup/loop, utility serial commands, delegates state commands to `PatrolController`. |
+| `SerialProtocol.h/.cpp` | Parses newline serial commands such as `STATUS:...`, drive commands, and `EMERGENCY_STOP`/`ESTOP`. |
+| `PatrolController.h/.cpp` | Robot state machine: `Patrol`, `FireAlert`, `Verification`, `SecurityAlert`, `VerifiedPause`, `ManualDrive`, `ArrivalStop`, `EmergencyStop`. |
+| `StatusOutputs.h/.cpp` | LEDs, OLED, buzzer, servo output helpers, including emergency-stop OLED screen. |
+| `MotorControl.h/.cpp` | Four-motor differential drive helpers and motor stop. |
+| `SensorSuite.h/.cpp` | Hazard and distance sensor reads. |
+| `Config.h` | Pin map, thresholds, timings, PWM, and autonomous-start defaults. |
+
+**Fire alert behavior:**
+- `Config::kStartInPatrol` is enabled, so the Arduino enters `PATROL` after boot/reset instead of waiting in manual stop.
+- Side/rear flame directions are inspected before the alert snapshot: `LEFT`/`LEFT_REAR` use `Config::kFireLeftSideTurnMs`, `RIGHT`/`RIGHT_REAR` use `Config::kFireRightSideTurnMs`, and `REAR` uses `Config::kFireRearTurnMs`.
+- Fire inspection turns use the stronger `Config::kPwmFireTurn` instead of the normal 90-degree turn PWM so all four drive motors have more torque during fire orientation.
+- Before a directional fire turn, Arduino stops for `Config::kFirePreTurnSettleMs`; after the inspection turn, it stops for `Config::kFireSnapshotSettleMs` before emitting `SNAP:fire`, then holds for `Config::kFirePostSnapshotHoldMs` before any restore/resume movement is allowed.
+- The robot remains stopped while any fire/gas hazard is still reported. Once the hazard is clear for `Config::kFireClearStableMs`, the robot rotates back by the inverse turn and resumes the previous route state.
+- Ambiguous multi-direction or gas-only alerts do not make an arbitrary turn; they stop, snapshot, hold until clear, then resume.
+
+**Verification behavior:**
+- Entering `Verification` now backs up slowly for `Config::kVerificationBackupMs` before face scan, unless the rear ultrasonic reports less than `Config::kVerificationBackupRearClearCm`.
+- If Jetson reports `SCANNING:LEFT` or `SCANNING:RIGHT`, Arduino applies a short 300 ms left/right heading correction before starting the face-scan timer.
+- After a successful verification, `VerifiedPause` holds the robot stopped for `Config::kVerifiedPauseMs` before returning to patrol.
+
+**Patrol speed behavior:**
+- Normal patrol speed uses `Config::kPwmForward`, near-obstacle creep uses `Config::kPwmSlowForward`, and avoidance backup uses `Config::kPwmBackup`.
+
+**Emergency stop behavior:**
+- Jetson/web sends `EMERGENCY_STOP`; Arduino also accepts `ESTOP`.
+- `PatrolController::enterEmergencyStop()` stops motors, detaches servo, silences buzzer, sets brake lights/red LED, shows an emergency OLED screen, emits `MODE:EMERGENCY_STOP`.
+- While in `EmergencyStop`, the controller keeps calling `motors_.stop()` and ignores `STATUS`, face, and drive commands. `AUTO` is the explicit resume command.
+- Hazard detection does not override `EmergencyStop`; the robot remains stopped until `AUTO` or reset.
+
+**Route arrival behavior:**
+- Jetson sends `ARRIVAL_REACHED` when it confirms the QR marker payload `PATROLPRO:ARRIVAL:1`.
+- Arduino enters `ArrivalStop`, stops motors, shows an `ARRIVED` mode/OLED message, and stays stopped until `AUTO`.
+- Arrival now overrides active non-emergency modes immediately, including fire/security/verification states.
+- Once in `ArrivalStop`, hazard detection no longer overrides the route-ended stop state. `EmergencyStop` remains the highest-priority manual safety stop.
 
 ---
 
@@ -400,6 +461,9 @@ snapshots/
   person/     — <category>_<tid>_<timestamp>.jpg  (new YOLO track)
   face/       — <category>_<tid>_<timestamp>.jpg  (first SCRFD face detected)
   verified/   — <category>_<tid>_<timestamp>.jpg  (face matched DB)
+  arrival/    — <category>_<tid>_<timestamp>.jpg  (route-arrival QR marker detected)
+  unknown/    — <category>_<tid>_<timestamp>.jpg  (FACE_UNKNOWN confirmed or SECURITY_ALERT mode)
+  fire/       — <category>_<tid>_<timestamp>.jpg  (FIRE_ALERT mode frame)
 logs/
   events.csv  — timestamp, event, track_id, name, mode
 ```
@@ -410,9 +474,15 @@ logs/
 | `PERSON_SNAP` | New person track snapshot saved |
 | `FACE_SNAP` | Face-detected snapshot saved |
 | `VERIFIED_SNAP` | Verified snapshot saved |
+| `UNKNOWN_SNAP` | Unknown/security snapshot saved |
+| `FIRE_SNAP` | Fire/gas alert snapshot saved |
 | `FACE_VERIFIED` | Face matched DB (log row only, no image) |
 | `FACE_UNKNOWN` | No face for timeout period |
 | `FACE_TIMEOUT` | Person left frame without verification |
+| `ARRIVAL_REACHED` | Route-arrival QR marker confirmed |
+| `EMERGENCY_STOP` | Browser dashboard requested Arduino motor stop |
+| `AUTO_PATROL` | Browser dashboard requested Arduino auto patrol / resume |
+| `PATROL_STOP` | Browser dashboard requested normal patrol stop |
 
 **Key config:**
 ```python
@@ -421,6 +491,80 @@ LOG_DIR      = "<script_dir>/logs"
 LOG_FILE     = "<script_dir>/logs/events.csv"
 JPEG_QUALITY = 92
 ```
+
+---
+
+## web_dashboard.py
+
+**Role:** Lightweight browser dashboard for the Jetson runtime. Imported by `detect_people.py` only when serving the optional web view.
+
+**Served views / APIs:**
+
+| Route | What it returns |
+|---|---|
+| `/` | Single-page dashboard with live camera, runtime metrics, snapshot gallery, event table, and danger alert overlay |
+| `/stream.mjpg` | MJPEG stream from the already-drawn OpenCV frame |
+| `/api/status` | JSON runtime status, frame freshness, snapshot counts, latest event |
+| `/api/snapshots?limit=N` | JSON list of recent JPEG/PNG files under `snapshots/` |
+| `/api/events?limit=N` | JSON rows from `logs/events.csv`, newest first |
+| `POST /api/control/emergency-stop` | Sends `EMERGENCY_STOP` through the Jetson serial bridge and returns queue/connectivity status |
+| `POST /api/control/auto-patrol` | Sends `AUTO` through the Jetson serial bridge so Arduino can leave safe boot/manual stop and accept patrol/scan events |
+| `POST /api/control/patrol-stop` | Sends `STOP` through the Jetson serial bridge for a normal patrol stop without latching emergency mode |
+| `/snapshots/<category>/<file>` | Static snapshot image file, path-clamped under `SNAP_DIR` |
+
+Snapshot folders are grouped into dashboard filters: `arrival` covers `arrival`/`arrived`/`route`; `unknown` covers `unknown`/`security`/`intruder`; `fire` covers `fire`/`fire_immediate`/`hazard`/`gas`/`smoke`/`flame`.
+
+The dashboard polls `/api/status`; when `latest_event` changes to a danger event (`FIRE`/`GAS`/`SMOKE`/`FLAME`/`HAZARD` or `UNKNOWN`/`SECURITY`/`INTRUDER`), it shows one large centered overlay for about 7 seconds. Existing latest events are primed on page load so old alerts do not pop repeatedly after refresh.
+The top toolbar includes Start Patrol, Stop Patrol, and Emergency Stop buttons. Start Patrol POSTs to the control API and sends/logs `AUTO_PATROL` (`AUTO` on serial). Stop Patrol sends/logs `PATROL_STOP` (`STOP` on serial) without latching emergency mode. Emergency Stop sends/logs `EMERGENCY_STOP`; the event table and centered alert reflect the stop event.
+
+**Key classes:**
+
+| Class | What it does |
+|---|---|
+| `DashboardState` | Thread-safe latest JPEG frame + runtime status store. Encodes at `max_fps`, optionally downscales stream width. |
+| `DashboardServer` | Starts/stops a background threaded HTTP server and exposes `update_frame(frame, status)`. |
+
+**Run command:**
+```bash
+python3 detect_people.py --web --no-local-display
+```
+
+Then open:
+```text
+http://<jetson-ip>:8080/
+```
+
+**Key config defaults:**
+```python
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 8080
+DEFAULT_JPEG_QUALITY = 82
+DEFAULT_STREAM_FPS = 8.0
+DEFAULT_STREAM_WIDTH = 960
+```
+
+---
+
+## generate_arrival_qr.py
+
+**Role:** Generates the printable SVG QR marker used as the route endpoint.
+
+**Default output:**
+```text
+arrival_marker.svg
+```
+
+**Default payload:**
+```text
+PATROLPRO:ARRIVAL:1
+```
+
+**Run command:**
+```bash
+python3 generate_arrival_qr.py
+```
+
+The script intentionally uses no third-party packages. It creates a QR Code Model 2, Version 1-L SVG with a four-module quiet zone.
 
 ---
 
@@ -443,7 +587,7 @@ JPEG_QUALITY = 92
 
 **`default_command_handler(cmd, arg)`** — used by `detect_people.py`:
 - `PLAY:<name>` → stub (Phase 5: `audio_player.play(arg)`)
-- `MODE:<state>` → prints current Arduino mode
+- `MODE:<state>` → prints current Arduino mode; saves immediate fire/security frames for dashboard review
 - `SNAP:<category>` → stub (Phase 7: `snapshot_writer.save(frame, arg)`)
 
 **Jetson → Arduino events:**
@@ -454,6 +598,9 @@ JPEG_QUALITY = 92
 | `FACE_VERIFIED:<name>` | `mark_verified()` called after DB match |
 | `FACE_UNKNOWN` | `face_id` alert status (no face for 2 s) |
 | `FACE_TIMEOUT` | Track disappeared from frame before verification |
+| `ARRIVAL_REACHED` | Route-arrival QR marker was confirmed |
+| `EMERGENCY_STOP` | Browser dashboard emergency stop button |
+| `AUTO` | Browser dashboard Start Patrol button, logged as `AUTO_PATROL` |
 | `HEARTBEAT` | Automatically every 2 s by background thread |
 
 **Arduino → Jetson commands (received):**
@@ -463,6 +610,11 @@ JPEG_QUALITY = 92
 | `PLAY:<name>` | Play named audio clip |
 | `MODE:<state>` | Log current Arduino mode |
 | `SNAP:<category>` | Save snapshot frame |
+
+Alert snapshots:
+- `MODE:FIRE_ALERT` → `snapshots/fire_immediate/`
+- `SNAP:fire` → `snapshots/fire/`
+- `MODE:SECURITY_ALERT` → `snapshots/unknown/`
 
 **Key config:**
 ```python
@@ -500,6 +652,14 @@ HEARTBEAT_INTERVAL_S = 2.0
 | Session 4 | Changed `ARDUINO_PORT` default from `/dev/ttyUSB0` to `/dev/ttyACM0` (genuine Arduino Mega uses ATmega16U2 → ACM device). Replaced `try/except KeyboardInterrupt` with SIGINT flag (`_shutdown`) + `os._exit(0)` to prevent pycuda core dump on exit. |
 | Session 4 | Added `_send(link, msg, note)` helper — wraps `link.send()` with clean `[Jetson→Arduino]` terminal print. Added `last_face_status` dict to suppress repeated face-status prints (only prints on change). Replaced all bare `link.send()` calls with `_send()`. Cleaned startup messages. |
 | Session 4 | Added `ANNOUNCE_CONFIRM_FRAMES=8` gate on `PERSON_DETECTED`: a new track must be continuously active for 8 consecutive frames before Arduino is notified. Prevents ghost re-ID tracks (verified person's box briefly misses IoU match → new track ID that lasts <45 frames) from triggering a false verification cycle. `announce_count{}` dict tracks per-track frame count; pruned alongside the vanish handler. |
+| Session 5 | Added optional browser dashboard flags: `--web`, `--web-host`, `--web-port`, `--web-fps`, `--web-quality`, `--web-width`, and `--no-local-display`. The main loop now publishes the drawn frame and runtime counters to `web_dashboard.DashboardServer` when enabled. |
+| Session 5 | Added `snapshots/unknown/` save when `FACE_UNKNOWN` is confirmed, so the dashboard can separate unrecognized people from generic face snapshots. |
+| Session 6 | Added `_dashboard_control()` and wired `DashboardServer(control_handler=...)`; browser POST `/api/control/emergency-stop` now queues `EMERGENCY_STOP` to Arduino and logs an `EMERGENCY_STOP` event. |
+| Session 7 | Added QR route-arrival detection with `cv2.QRCodeDetector`. The marker payload `PATROLPRO:ARRIVAL:1` must be decoded twice before Jetson sends `ARRIVAL_REACHED`, saves an `arrival` snapshot, and logs the arrival event. |
+| Session 8 | Added `AUTO_PATROL` dashboard control path. The web Start Patrol button sends serial `AUTO`, which is required after safe boot/manual stop before Arduino will enter verification from `STATUS:...SCANNING`. |
+| Session 11 | Restored the explicit `PERSON_DETECTED` serial event when a track passes `ANNOUNCE_CONFIRM_FRAMES`; `STATUS:Tn:SCANNING:<LEFT|CENTER|RIGHT>` remains in the status packet. |
+| Session 18 | Added `PATROL_STOP` dashboard control path. The web Stop Patrol button sends serial `STOP` and logs `PATROL_STOP`, giving normal stop/start control without emergency latch. |
+| Session 19 | Moved route-arrival QR detection to the start of each frame before YOLO/face work, changed confirmation to a single matching decode, and added grayscale/equalized/scaled fallback decode candidates for faster endpoint recognition. |
 
 ### enroll.py
 | When | Change |
@@ -542,12 +702,34 @@ HEARTBEAT_INTERVAL_S = 2.0
 |---|---|
 | Session 3 | Created. 4-motor differential drive + wall-bounce navigation. Phase 1 (motors) and Phase 2 (patrol) implementation. Standalone file — merge into main firmware in Phase 4. |
 
+### PatrolPro_Phase2/ modular Arduino firmware
+| When | Change |
+|---|---|
+| Session 6 | Added latched emergency stop path: `SerialProtocol` parses `EMERGENCY_STOP`/`ESTOP`; `PatrolController` adds `EmergencyStop` mode, stops motors continuously, ignores drive/status commands while locked, and resumes only on `AUTO`; `StatusOutputs` adds an emergency stop OLED screen. |
+| Session 7 | Added route-arrival path: `SerialProtocol` parses `ARRIVAL_REACHED`/`ARRIVED`; `PatrolController` adds `ArrivalStop` mode, stops motors at the QR endpoint, holds arrival pending during active alerts, returns to `ArrivalStop` after alerts, and resumes only on `AUTO`; `StatusOutputs` adds an arrival OLED screen. |
+| Session 8 | Fixed verification getting stuck on repeated `STATUS:Tn:SCANNING:*`. `PostScanWait` timeout is no longer reset by repeated scanning status packets, so unresolved scans can progress to `SECURITY_ALERT`. |
+| Session 9 | Enabled autonomous patrol on boot/reset. Reworked `FireAlert` into orient/hold/restore stages: side fire rotates 90° toward the source, rear fire rotates 180°, `SNAP:fire` is sent after the inspection turn, the robot stays stopped while hazards persist, then rotates back and resumes the prior route state after a stable clear. |
+| Session 11 | Added verification backup and late alignment application. This left/right wheel alignment behavior was later disabled in Session 12. |
+| Session 12 | Removed person-side wheel alignment during verification and increased verification backup from 600 ms to 1200 ms. After backing up, Arduino starts face scan without turning toward `SCANNING:LEFT` or `SCANNING:RIGHT`. |
+| Session 13 | Increased `VerifiedPause` from 1000 ms to 2000 ms so the robot remains stopped for about two seconds after a successful scan before resuming patrol. |
+| Session 14 | Added `FireAlert` pre-turn stop, increased directional fire inspection turn durations, increased post-turn snapshot settle to 1000 ms, and increased verification backup from 1200 ms to 1800 ms. |
+| Session 15 | Increased fire turn torque with `kPwmFireTurn=42`, increased side/rear fire turn durations again, and added a 2000 ms post-snapshot hold so fire inspection stays stopped after `SNAP:fire` before restore/resume. |
+| Session 16 | Reduced fire over-rotation by lowering `kPwmFireTurn` to 38 and shortening side/rear fire turn durations. Slowed patrol movement by lowering `kPwmForward`, `kPwmSlowForward`, and `kPwmBackup`. |
+| Session 17 | Swapped `StatusOutputs::showLeftTurnSignal()` and `showRightTurnSignal()` brake-group outputs to match the physical left/right LED wiring. |
+| Session 18 | Reduced verification backup from 1800 ms to 1400 ms to avoid excessive reverse movement after person detection. |
+| Session 19 | Changed `ARRIVAL_REACHED` to enter `ArrivalStop` immediately from any non-emergency mode, and prevented hazard detection from overriding `ArrivalStop` after the route endpoint is reached. |
+
 ### arduino_link.py
 | When | Change |
 |---|---|
 | Session 3 | Created. Jetson-side USB serial bridge. Background thread, auto-reconnect, heartbeat, `send()`/`register_command_handler()`. Wired into `detect_people.py`. |
 | Session 3 | **Phase 5:** Imported `audio_player`. Updated `default_command_handler` — `PLAY:` now calls `audio_player.play(arg)` instead of stub. |
 | Session 3 | **Phase 7:** Imported `snapshot_writer`. Updated `default_command_handler` — `SNAP:` now calls `snapshot_writer.save_current(arg)` instead of stub. |
+| Session 5 | `MODE:FIRE_ALERT` now saves the current frame to `snapshots/fire/`; `MODE:SECURITY_ALERT` saves to `snapshots/unknown/` for dashboard filtering. |
+| Session 6 | Documented `EMERGENCY_STOP` as a Jetson-to-Arduino event used by the browser dashboard control API. |
+| Session 7 | Documented `ARRIVAL_REACHED` as a Jetson-to-Arduino event sent after QR route marker confirmation. |
+| Session 9 | Removed the immediate `MODE:FIRE_ALERT` snapshot path so fire frames are saved only when Arduino sends `SNAP:fire` after directional inspection. Security-alert mode snapshots still map to `snapshots/unknown/`. |
+| Session 10 | Restored immediate fire capture as `snapshots/fire_immediate/` while keeping directional post-turn `SNAP:fire` captures in `snapshots/fire/`. |
 
 ### hazard_monitor/hazard_monitor.ino (Phase 8 additions)
 | When | Change |
@@ -574,6 +756,23 @@ HEARTBEAT_INTERVAL_S = 2.0
 | When | Change |
 |---|---|
 | Session 3 | **Phase 7:** Created. `update_frame()`, `save()`, `save_current()`, `log_event()`. Saves JPEG crops to `snapshots/{person,face,verified}/`. Appends to `logs/events.csv` (auto-creates header). `JPEG_QUALITY=92`. |
+
+### web_dashboard.py
+| When | Change |
+|---|---|
+| Session 5 | Created. Standard-library threaded HTTP dashboard with `/stream.mjpg`, `/api/status`, `/api/snapshots`, `/api/events`, and secured snapshot file serving. Provides a single-page UI for live video, runtime metrics, saved snapshots, snapshot details, and event logs. |
+| Session 5 | Added purpose-based snapshot grouping/filter buttons: Unknown, Fire / Gas, Verified, Person, Face, and Other. Raw folders such as `security`, `intruder`, `hazard`, `gas`, and `flame` are mapped into the appropriate dashboard group. |
+| Session 5 | Added centered danger alert overlay. New fire/gas/hazard or unknown/security/intruder events trigger a large temporary browser alert, deduplicated by event row. |
+| Session 6 | Added Emergency Stop toolbar button and `POST /api/control/emergency-stop`; the UI reports queue/connectivity state and the logged stop event can trigger the centered alert overlay. |
+| Session 7 | Added `Arrival` snapshot grouping/filter so QR endpoint snapshots appear separately from people, face, fire, and unknown captures. |
+| Session 8 | Added Start Patrol toolbar button and `POST /api/control/auto-patrol`; this sends `AUTO` through the active Jetson serial bridge without opening a second serial monitor. |
+| Session 10 | Added `fire_immediate` to the Fire / Gas snapshot grouping so immediate fire captures and post-turn `SNAP:fire` captures appear under the same dashboard filter. |
+| Session 18 | Added Stop Patrol toolbar button and `POST /api/control/patrol-stop`; this sends normal serial `STOP` through the active Jetson serial bridge. |
+
+### generate_arrival_qr.py
+| When | Change |
+|---|---|
+| Session 7 | Created. Dependency-free QR SVG generator for `PATROLPRO:ARRIVAL:1`; outputs `arrival_marker.svg` for printing as the route endpoint marker. |
 
 ### bt_receiver.py
 | When | Change |

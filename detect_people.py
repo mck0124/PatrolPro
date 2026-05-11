@@ -1,4 +1,5 @@
 # detect_people.py
+import argparse
 import cv2
 import numpy as np
 import tensorrt as trt
@@ -9,7 +10,9 @@ import signal
 import os
 from face_id import FaceIdentifier, draw_face_result
 from arduino_link import ArduinoLink, default_command_handler
+from web_dashboard import DashboardServer
 import snapshot_writer
+import audio_player
 
 # ── graceful shutdown flag ────────────────────────────────────────────────────
 # SIGINT handler sets this; main loop checks it each frame instead of catching
@@ -36,6 +39,12 @@ ANNOUNCE_CONFIRM_FRAMES = 24 # consecutive active frames before PERSON_DETECTED 
                               # = ~1 s at 24 FPS — ghost re-ID tracks die before reaching this
 PERSON_CLS  = 0          # COCO class 0 = person
 ARDUINO_PORT = "/dev/ttyUSB0"   # Arduino Mega (genuine): ttyACM0; CH340 clone: ttyUSB0
+ALIGN_LEFT_MAX_RATIO = 0.40
+ALIGN_RIGHT_MIN_RATIO = 0.60
+ARRIVAL_QR_PAYLOAD = "PATROLPRO:ARRIVAL:1"
+QR_DETECT_EVERY_N_FRAMES = 1
+ARRIVAL_CONFIRM_DETECTIONS = 1
+QR_FALLBACK_SCALE = 1.5
 
 GST_PIPELINE = (
     "nvarguscamerasrc ! "
@@ -255,6 +264,94 @@ def draw(frame, active_tracks, verified_ids, track_names):
     return frame
 
 
+def _scale_qr_points(points, scale):
+    """Map QR detector points back to the original frame scale."""
+    if points is None or scale == 1.0:
+        return points
+
+    pts = np.asarray(points, dtype=np.float32) / scale
+    return pts.reshape(np.asarray(points).shape)
+
+
+def _decode_qr_candidate(detector, image, scale):
+    """Try single and multi QR decode on one candidate image."""
+    if hasattr(detector, "detectAndDecodeMulti"):
+        try:
+            ok, decoded_info, points, _ = detector.detectAndDecodeMulti(image)
+            if ok:
+                for idx, decoded in enumerate(decoded_info):
+                    decoded = (decoded or "").strip()
+                    if decoded:
+                        candidate_points = None
+                        if points is not None and idx < len(points):
+                            candidate_points = points[idx]
+                        return decoded, _scale_qr_points(candidate_points, scale)
+        except cv2.error:
+            pass
+
+    try:
+        decoded, points, _ = detector.detectAndDecode(image)
+        decoded = (decoded or "").strip()
+        if decoded:
+            return decoded, _scale_qr_points(points, scale)
+    except cv2.error:
+        pass
+
+    return "", None
+
+
+def detect_qr_payload(frame, detector):
+    """Return decoded QR payload and corner points for the current frame."""
+    if detector is None or frame is None:
+        return "", None
+
+    candidates = [(frame, 1.0)]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    candidates.append((gray, 1.0))
+    candidates.append((cv2.equalizeHist(gray), 1.0))
+
+    if QR_FALLBACK_SCALE > 1.0:
+        scaled = cv2.resize(
+            gray,
+            None,
+            fx=QR_FALLBACK_SCALE,
+            fy=QR_FALLBACK_SCALE,
+            interpolation=cv2.INTER_LINEAR,
+        )
+        candidates.append((scaled, QR_FALLBACK_SCALE))
+
+    for image, scale in candidates:
+        decoded, points = _decode_qr_candidate(detector, image, scale)
+        if decoded:
+            return decoded, points
+
+    return "", None
+
+
+def draw_qr_marker(frame, points, label):
+    """Draw a visible outline around a detected QR marker."""
+    if points is None:
+        return frame
+
+    pts = np.asarray(points, dtype=np.int32).reshape(-1, 2)
+    if len(pts) < 4:
+        return frame
+
+    cv2.polylines(frame, [pts], True, (0, 220, 255), 3)
+    x = int(np.min(pts[:, 0]))
+    y = int(np.min(pts[:, 1]))
+    cv2.putText(
+        frame,
+        label,
+        (max(0, x), max(24, y - 10)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 220, 255),
+        2,
+    )
+    return frame
+
+
 def _send(link, msg, note=""):
     """Send a Jetson event to Arduino and log it clearly."""
     link.send(msg)
@@ -262,7 +359,70 @@ def _send(link, msg, note=""):
     print(f"  [Jetson→Arduino] {msg}{suffix}")
 
 
+def _dashboard_control(link, command):
+    """Handle commands issued from the browser dashboard."""
+    command = (command or "").strip().upper()
+    if command == "EMERGENCY_STOP":
+        serial_command = "EMERGENCY_STOP"
+        event_name = "EMERGENCY_STOP"
+        mode = "WEB"
+        note = "web emergency stop"
+    elif command == "AUTO_PATROL":
+        serial_command = "AUTO"
+        event_name = "AUTO_PATROL"
+        mode = "WEB"
+        note = "web start patrol"
+    elif command == "PATROL_STOP":
+        serial_command = "STOP"
+        event_name = "PATROL_STOP"
+        mode = "WEB"
+        note = "web stop patrol"
+    else:
+        raise ValueError("Unsupported dashboard command: {}".format(command))
+
+    _send(link, serial_command, note)
+    snapshot_writer.log_event(event_name, -1, "", mode)
+    return {
+        "arduino_connected": link.is_connected(),
+        "serial_command": serial_command,
+        "queued": True,
+    }
+
+
+def alignment_hint_for_box(box, frame_width):
+    """Return where the robot should turn before face scan."""
+    if box is None or frame_width <= 0:
+        return "CENTER"
+
+    x1, _, x2, _ = box
+    center_ratio = ((float(x1) + float(x2)) * 0.5) / float(frame_width)
+    if center_ratio < ALIGN_LEFT_MAX_RATIO:
+        return "LEFT"
+    if center_ratio > ALIGN_RIGHT_MIN_RATIO:
+        return "RIGHT"
+    return "CENTER"
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Patrol Pro vision runtime")
+    parser.add_argument("--web", action="store_true", help="Enable the browser dashboard")
+    parser.add_argument("--web-host", default="0.0.0.0", help="Dashboard bind host")
+    parser.add_argument("--web-port", type=int, default=8080, help="Dashboard port")
+    parser.add_argument("--web-fps", type=float, default=8.0, help="MJPEG stream frame rate")
+    parser.add_argument("--web-quality", type=int, default=82, help="MJPEG JPEG quality")
+    parser.add_argument("--web-width", type=int, default=960, help="MJPEG stream width")
+    parser.add_argument(
+        "--no-local-display",
+        action="store_true",
+        help="Skip cv2.imshow; useful when viewing only through the browser dashboard",
+    )
+    return parser
+
+
 def main():
+    args = build_parser().parse_args()
+    dashboard = None
+
     print("Loading TRT engine...")
     engine  = load_engine(ENGINE_PATH)
     context = engine.create_execution_context()
@@ -272,12 +432,24 @@ def main():
     tracker     = PersonTracker(max_disappeared=45, match_iou=0.3)
     face_id     = FaceIdentifier()
     track_names        = {}    # track_id -> verified person name
-    announced          = set() # track_ids for which PERSON_DETECTED was sent
-    announce_count     = {}    # tid -> consecutive active frames (pre-announcement gate)
+    announced          = set() # track_ids that passed the 24-frame gate
+    announce_count     = {}    # tid -> consecutive active frames (pre-gate)
     face_snapped       = set() # track_ids for which a "face" snapshot was saved
-    face_unknown_sent  = set() # track_ids for which FACE_UNKNOWN was sent
+    confirmed_unknown  = set() # track_ids confirmed not-in-DB (>= UNKNOWN_CONFIRM_COUNT frames)
     face_unknown_count = {}    # tid -> consecutive "unknown" frame count (debounce)
+    verified_played    = set() # track_ids for which verified snapshot/log was written
     last_face_status   = {}    # tid -> last printed face status (suppress repeats)
+    last_status        = ""    # last STATUS payload — only print when it changes
+    arrival_reached    = False
+    arrival_count      = 0
+    last_ignored_qr    = ""
+
+    qr_detector = None
+    if hasattr(cv2, "QRCodeDetector"):
+        qr_detector = cv2.QRCodeDetector()
+        print("[QR] Arrival marker payload: {}".format(ARRIVAL_QR_PAYLOAD))
+    else:
+        print("[QR] cv2.QRCodeDetector is unavailable; arrival marker disabled.")
 
     link = ArduinoLink(port=ARDUINO_PORT)
     link.register_command_handler(default_command_handler)
@@ -292,6 +464,20 @@ def main():
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Camera open: {orig_w}x{orig_h}  |  Press Q to quit\n")
 
+    if args.web:
+        dashboard = DashboardServer(
+            host=args.web_host,
+            port=args.web_port,
+            jpeg_quality=args.web_quality,
+            max_fps=args.web_fps,
+            stream_width=args.web_width,
+            control_handler=lambda command: _dashboard_control(link, command),
+        )
+        dashboard.start()
+        print("[Web] Dashboard running at {}".format(dashboard.url_hint()))
+        if args.no_local_display:
+            print("[Web] Local OpenCV window disabled.")
+
     prev_t   = time.time()
     frame_no = 0
     while not _shutdown:
@@ -301,6 +487,33 @@ def main():
             break
 
         snapshot_writer.update_frame(frame)   # keep latest frame for SNAP: commands
+        arrival_points = None
+
+        # Check the route marker before the heavy YOLO/face pipeline so arrival
+        # can stop the robot even while another detection state is active.
+        if not arrival_reached and qr_detector is not None and frame_no % QR_DETECT_EVERY_N_FRAMES == 0:
+            try:
+                qr_payload, arrival_points = detect_qr_payload(frame, qr_detector)
+            except cv2.error as exc:
+                print("[QR] detector error: {}".format(exc))
+                qr_detector = None
+                qr_payload = ""
+
+            if qr_payload == ARRIVAL_QR_PAYLOAD:
+                arrival_count += 1
+                if arrival_count >= ARRIVAL_CONFIRM_DETECTIONS:
+                    arrival_reached = True
+                    _send(link, "ARRIVAL_REACHED", "arrival QR marker detected")
+                    snapshot_writer.save(frame, None, "arrival", -1, ARRIVAL_QR_PAYLOAD)
+                    snapshot_writer.log_event("ARRIVAL_REACHED", -1, ARRIVAL_QR_PAYLOAD, "QR")
+                    print("  [QR] Arrival marker confirmed")
+            elif qr_payload:
+                arrival_count = 0
+                if qr_payload != last_ignored_qr:
+                    last_ignored_qr = qr_payload
+                    print("  [QR] ignored marker: {}".format(qr_payload))
+            else:
+                arrival_count = 0
 
         # ── inference ──────────────────────────────
         inp = preprocess(frame)
@@ -315,39 +528,42 @@ def main():
         # ── tracking ───────────────────────────────
         active_tracks = tracker.update(boxes)
 
-        # ── serial: detect disappeared unverified tracks ────
-        # Use tracker.tracks (all IDs, including gone>0 ones still within max_disappeared)
-        # so a single missed frame does NOT trigger FACE_TIMEOUT prematurely.
+        # ── clean up fully-pruned tracks ────────────────────────────────────────
+        # tracker.tracks holds all IDs until gone > max_disappeared (45 frames).
+        # If an announced track leaves before verification/unknown, tell Arduino
+        # immediately before the next STATUS packet removes it from context.
         all_track_ids = set(tracker.tracks.keys())
-
-        # Tracks that were announced but have now fully disappeared
-        vanished = announced - tracker.verified - all_track_ids
-        for tid in vanished:
-            _send(link, "FACE_TIMEOUT", f"track #{tid} left scene")
-            snapshot_writer.log_event("FACE_TIMEOUT", tid, "", "")
-            announced.discard(tid)
-            face_snapped.discard(tid)
-            face_unknown_sent.discard(tid)
-            face_unknown_count.pop(tid, None)
-            last_face_status.pop(tid, None)
+        for tid in list(announced):
+            if tid not in all_track_ids:
+                if tid not in tracker.verified and tid not in confirmed_unknown:
+                    _send(link, "FACE_TIMEOUT", f"track #{tid} left unverified")
+                    snapshot_writer.log_event("FACE_TIMEOUT", tid, "", "")
+                announced.discard(tid)
+                confirmed_unknown.discard(tid)
+                face_snapped.discard(tid)
+                face_unknown_count.pop(tid, None)
+                verified_played.discard(tid)
+                last_face_status.pop(tid, None)
+                print(f"  [Track #{tid}] left scene — removed from tracking")
 
         # Ghost re-ID tracks: pending announcement but already pruned by tracker
         for tid in list(announce_count.keys()):
             if tid not in all_track_ids:
                 announce_count.pop(tid, None)  # silently discard — never reached threshold
 
-        # ── serial: announce new unverified tracks ──────────
-        # Require ANNOUNCE_CONFIRM_FRAMES consecutive active frames before sending
-        # PERSON_DETECTED — silently drops ghost re-ID tracks (a verified person's
-        # box briefly misses IoU match → new track ID, gone again next frame).
+        # ── announce gate — 24 consecutive active frames before Arduino sees it ──
         for tid, box in active_tracks.items():
-            if tid not in tracker.verified and tid not in announced:
+            if tid not in announced and tid not in tracker.verified:
                 announce_count[tid] = announce_count.get(tid, 0) + 1
                 if announce_count[tid] >= ANNOUNCE_CONFIRM_FRAMES:
-                    _send(link, "PERSON_DETECTED", f"track #{tid}")
                     announced.add(tid)
                     announce_count.pop(tid, None)
                     snapshot_writer.save(frame, box, "person", tid)
+                    _send(link, "PERSON_DETECTED", "track #{} confirmed".format(tid))
+                    count = len(announced)
+                    clip = "detected_person" if count == 1 else f"{count}_detected"
+                    audio_player.play(clip)
+                    print(f"  [Track #{tid}] confirmed — {count} person(s) on screen")
 
         # ── face identification (throttled) ────────
         if frame_no % FACE_ID_EVERY_N_FRAMES == 0:
@@ -376,32 +592,55 @@ def main():
                 if status == "verified":
                     tracker.mark_verified(tid)
                     track_names[tid] = result["name"]
-                    _send(link, f"FACE_VERIFIED:{result['name']}", f"track #{tid}")
-                    announced.discard(tid)
-                    face_unknown_sent.discard(tid)
                     face_unknown_count.pop(tid, None)
-                    snapshot_writer.save(frame, box, "verified", tid, result["name"])
-                    snapshot_writer.log_event("FACE_VERIFIED", tid, result["name"], "")
+                    if tid not in verified_played:
+                        verified_played.add(tid)
+                        snapshot_writer.save(frame, box, "verified", tid, result["name"])
+                        snapshot_writer.log_event("FACE_VERIFIED", tid, result["name"], "")
 
-                elif status == "unknown" and tid not in face_unknown_sent:
+                elif status == "unknown":
                     # Require UNKNOWN_CONFIRM_COUNT consecutive "unknown" frames before
                     # declaring intruder — prevents a transient ArcFace miss from
                     # triggering SECURITY_ALERT while the real owner is still in frame.
                     face_unknown_count[tid] = face_unknown_count.get(tid, 0) + 1
                     if face_unknown_count[tid] >= UNKNOWN_CONFIRM_COUNT:
-                        _send(link, "FACE_UNKNOWN", f"track #{tid}, {UNKNOWN_CONFIRM_COUNT} consecutive frames")
-                        face_unknown_sent.add(tid)
-                        snapshot_writer.log_event("FACE_UNKNOWN", tid, "", "")
+                        if tid not in confirmed_unknown:
+                            confirmed_unknown.add(tid)
+                            snapshot_writer.save(frame, box, "unknown", tid)
+                            snapshot_writer.log_event("FACE_UNKNOWN", tid, "", "")
 
                 else:
                     # "no_face" or "alert" — reset unknown counter
                     face_unknown_count.pop(tid, None)
                     if status == "alert":
                         snapshot_writer.log_event("FACE_ALERT_NO_FACE", tid, "", "")
+
+            # ── STATUS packet protocol ──────────────────────────────────────────
+            # Arduino is the brain; Jetson sends a compact full-context snapshot.
+            entries = []
+            for tid in sorted(announced):
+                if tid in tracker.verified:
+                    entries.append(f"T{tid}:VERIFIED:{track_names.get(tid, '?')}")
+                elif tid in confirmed_unknown:
+                    entries.append(f"T{tid}:UNKNOWN")
+                else:
+                    box = active_tracks.get(tid)
+                    if box is None and tid in tracker.tracks:
+                        box = tracker.tracks[tid].get("box")
+                    alignment = alignment_hint_for_box(box, orig_w)
+                    entries.append(f"T{tid}:SCANNING:{alignment}")
+
+            payload = ",".join(entries) if entries else "CLEAR"
+            link.send(f"STATUS:{payload}")
+            if payload != last_status:
+                last_status = payload
+                print(f"  [Jetson→Arduino] STATUS:{payload}")
         frame_no += 1
 
         # ── display ────────────────────────────────
         frame = draw(frame, active_tracks, tracker.verified, track_names)
+        if arrival_points is not None:
+            frame = draw_qr_marker(frame, arrival_points, "ARRIVAL QR")
 
         now = time.time()
         fps = 1.0 / (now - prev_t + 1e-9)
@@ -409,12 +648,32 @@ def main():
         cv2.putText(frame, f"FPS: {fps:.1f}",
                     (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 200, 0), 2)
 
-        cv2.imshow("YOLO11n - Person Detection", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        if dashboard is not None:
+            verified_active = sum(1 for tid in active_tracks if tid in tracker.verified)
+            dashboard.update_frame(frame, status={
+                "fps": fps,
+                "people": len(active_tracks),
+                "verified": verified_active,
+                "unknown": len(confirmed_unknown),
+                "pending": max(0, len(active_tracks) - verified_active),
+                "announced": len(announced),
+                "frame_no": frame_no,
+                "camera_width": orig_w,
+                "camera_height": orig_h,
+                "arduino_port": ARDUINO_PORT,
+                "arrival_reached": arrival_reached,
+                "arrival_marker": ARRIVAL_QR_PAYLOAD,
+            })
+
+        if not args.no_local_display:
+            cv2.imshow("YOLO11n - Person Detection", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
     # ── cleanup ────────────────────────────────────────────────────────────────
     print("[Main] Releasing camera...")
+    if dashboard is not None:
+        dashboard.stop()
     cap.release()
     cv2.destroyAllWindows()
     face_id.close()

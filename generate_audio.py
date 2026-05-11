@@ -27,6 +27,8 @@ CLIPS = {
     "alert_fire":       "Warning! Fire detected. Please evacuate immediately.",
     "alert_intruder":   "Warning! Unidentified person detected. Security alert activated.",
     "detected_person":  "Person detected. Please stand by for identity verification.",
+    "2_detected":       "2 persons detected. Please stand by for identity verification.",
+    "3_detected":       "3 persons detected. Please stand by for identity verification.",
     "approach_camera":  "Please look directly at the camera for face verification.",
 }
 
