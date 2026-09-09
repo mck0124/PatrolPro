@@ -22,7 +22,7 @@ The architecture is designed around explicit safety priorities: environmental ha
 - **Hazard response:** Fire and gas sensing with prioritized stop, alarm, LED, OLED, and audio responses.
 - **Cross-device coordination:** USB serial messaging between Jetson perception services and the Arduino state machine.
 - **Operational visibility:** Snapshot/event logging and a lightweight browser dashboard for live status and review.
-- **Fail-safe startup:** The robot boots stopped and begins autonomous patrol only after an explicit `AUTO` command.
+- **Configurable startup:** The active firmware currently starts in patrol mode, while `kStartInPatrol` can be disabled for bench testing so the robot waits for an explicit `AUTO` command.
 
 ## System Architecture
 
@@ -49,14 +49,13 @@ For a deeper breakdown, see [Architecture](docs/ARCHITECTURE.md).
 
 ## Runtime Flow
 
-1. The Arduino boots in a safe stopped state.
-2. `AUTO` enables autonomous patrol.
-3. Ultrasonic and hazard sensors continuously influence movement and safety state.
-4. The Jetson detects and tracks people from the camera stream.
-5. Stable tracks trigger face verification.
-6. Jetson sends compact `STATUS:` messages to the Arduino.
-7. The Arduino transitions into verification, verified-user, unknown-person, or hazard states and drives the corresponding physical outputs.
-8. Events and snapshots are persisted for later review through the local dashboard.
+1. The Arduino initializes the active patrol configuration.
+2. Ultrasonic and hazard sensors continuously influence movement and safety state.
+3. The Jetson detects and tracks people from the camera stream.
+4. Stable tracks trigger face verification.
+5. Jetson sends compact `STATUS:` messages to the Arduino.
+6. The Arduino transitions into verification, verified-user, unknown-person, or hazard states and drives the corresponding physical outputs.
+7. Events and snapshots are persisted for later review through the local dashboard.
 
 ### Safety Priority
 
@@ -152,6 +151,8 @@ B 500      reverse for 0.5 seconds
 L 800      turn left for 0.8 seconds
 R 800      turn right for 0.8 seconds
 ```
+
+The active configuration has `kStartInPatrol = true`. Set it to `false` when you want a stopped bench-test startup that waits for `AUTO`.
 
 See [Serial Protocol](docs/SERIAL_PROTOCOL.md) for the full command/message reference.
 
