@@ -111,10 +111,23 @@ PatrolPro/
 ├── hazard_monitor/            # Earlier integrated Arduino prototype
 ├── wall_bounce/               # Motion-control prototype
 ├── docs/
+│   ├── README.md              # Documentation index
 │   ├── ARCHITECTURE.md
-│   └── SERIAL_PROTOCOL.md
+│   ├── SERIAL_PROTOCOL.md
+│   └── reference/
+│       ├── CODEBASE_NOTES.md
+│       └── JETSON_NOTES.md
 └── README.md
 ```
+
+## Documentation
+
+- [Documentation index](docs/README.md)
+- [System architecture](docs/ARCHITECTURE.md)
+- [Jetson ↔ Arduino serial protocol](docs/SERIAL_PROTOCOL.md)
+- [Arduino firmware guide](PatrolPro_Phase2/README_Phase2.md)
+- [Codebase reference](docs/reference/CODEBASE_NOTES.md)
+- [Jetson setup and troubleshooting](docs/reference/JETSON_NOTES.md)
 
 ## Quick Start
 
@@ -190,11 +203,15 @@ The Arduino can also send control messages back to the Jetson, including audio p
 
 The Jetson runtime handles `SIGINT` and `SIGTERM` through a shutdown flag so the main loop can finish the current frame rather than relying on an interrupt during CUDA execution.
 
-## Development Notes
+## Development References
 
-- `CODE_NOTES.md` contains detailed implementation notes for the codebase.
-- `PatrolPro_Phase2/README_Phase2.md` documents Arduino firmware behavior and tuning in greater detail.
-- `IR_test/`, `Servo_test/`, `wall_bounce/`, and `hazard_monitor/` preserve subsystem prototypes used during integration.
+Detailed working references have been moved out of the repository root so the project landing page stays portfolio-focused:
+
+- [Codebase Notes](docs/reference/CODEBASE_NOTES.md) — active modules, responsibilities, and historical prototypes.
+- [Jetson Notes](docs/reference/JETSON_NOTES.md) — platform environment, TensorRT setup, and troubleshooting.
+- [Phase 2 Firmware Guide](PatrolPro_Phase2/README_Phase2.md) — Arduino behavior, controls, and hardware-output details.
+
+Prototype directories such as `IR_test/`, `Servo_test/`, `wall_bounce/`, and `hazard_monitor/` are intentionally retained as engineering history rather than presented as active production modules.
 
 ## Project Context
 
