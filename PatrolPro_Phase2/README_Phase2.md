@@ -67,19 +67,15 @@ During normal operation these groups remain dim red as tail lights. They become 
 
 ## Boot and Patrol Behavior
 
-Wheel control is enabled, but the robot intentionally boots stopped because `Config.h` sets:
+The active configuration currently starts autonomous patrol after boot/reset:
 
-```text
-kStartInPatrol = false
+```cpp
+constexpr bool kStartInPatrol = true;
 ```
 
-Autonomous patrol begins only after the firmware receives:
+For bench testing or staged hardware integration, set `kStartInPatrol` to `false`; the controller will remain stopped until it receives `AUTO`.
 
-```text
-AUTO
-```
-
-This gives operators a predictable, safe startup state during integration and testing.
+Regardless of startup mode, the firmware accepts explicit `MANUAL`, `AUTO`, and `STOP` commands for operator control.
 
 ## Serial Monitor Commands
 
