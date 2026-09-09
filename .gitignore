@@ -1,6 +1,26 @@
+# Local environment
 .env
+.env.*
+.venv/
+venv/
 .DS_Store
 __pycache__/
 *.pyc
+
+# Local AI/runtime artifacts
+*.engine
+*.onnx
+face_db.pkl
+enrollments/
+snapshots/
+logs/
+*.wav
+
+# Editor / assistant-local files
 .claude/
 CLAUDE.md
+
+# Private working notes
+personal_notes.md
+SESSION_NOTES.md
+CODE_NOTES.md
